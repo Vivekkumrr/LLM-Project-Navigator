@@ -1,17 +1,37 @@
+from http import client
 import os
 import openai
-from config import OPENAI_API_KEY, OPENAI_MODEL
+from functools import lru_cache
+from config import OPENAI_API_KEY, OPENAI_MODEL, get_openai_status, is_valid_openai_key
+import logging
+import json
 
-print("🔧 llm_handler.py is loading...")
-print(f"🔧 OPENAI_API_KEY present: {bool(OPENAI_API_KEY)}")
+import uuid
+from logging_system import (
+    logger,
+    TokenCounter,
+    UsageTracker,
+    track_api_request,
+    log_api_response,
+    log_error_with_context
+)
 
-# Initialize OpenAI client
-if OPENAI_API_KEY and OPENAI_API_KEY.startswith('sk-'):
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    print("✅ OpenAI client initialized with valid API key")
-else:
-    client = None
-    print("❌ No valid OpenAI API key found")
+usage_tracker = UsageTracker()
+
+# Configure basic structured logging
+# Now handled by logging_system
+
+@lru_cache(maxsize=1)
+def get_openai_client():
+    if OPENAI_API_KEY and is_valid_openai_key(OPENAI_API_KEY):
+        return openai.OpenAI(api_key=OPENAI_API_KEY)
+    return None
+
+@lru_cache(maxsize=1)
+def get_llm_status():
+    status = get_openai_status()
+    status["openai_client_ready"] = bool(get_openai_client())
+    return status
 
 def is_project_creation_request(message):
     """More precise project creation detection"""
@@ -73,9 +93,14 @@ def is_feedback_request(message):
     
     return is_short and has_feedback_keywords
 
+@track_api_request(user_id="default")
 def call_openai_api(prompt, chat_history=None):
+    client = get_openai_client()
     if not client:
         return "❌ Error: No valid OpenAI API key configured."
+    
+    request_id = str(uuid.uuid4())
+    user_id = "default"
     
     try:
         # Build messages with full history
@@ -94,10 +119,16 @@ def call_openai_api(prompt, chat_history=None):
                     "role": msg["role"],
                     "content": msg["content"]
                 })
-        
-        # Add current prompt
-        messages.append({"role": "user", "content": prompt})
-        
+        else:
+            messages.append({
+                "role": "user",
+                "content": prompt
+            })
+
+        # Count input tokens
+        input_text = json.dumps(messages)
+        input_tokens = TokenCounter.count(input_text)
+
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
@@ -105,25 +136,68 @@ def call_openai_api(prompt, chat_history=None):
             temperature=0.7
         )
         
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
         
-    except openai.AuthenticationError:
+        # Count output tokens
+        output_tokens = TokenCounter.count(content)
+        cost = 0.00091
+        
+        usage_tracker.add_usage(input_tokens, output_tokens, cost)
+        log_api_response(request_id, user_id, input_tokens, output_tokens, cost)
+        
+        return content
+        
+    except openai.AuthenticationError as e:
+        log_error_with_context(e, request_id, user_id)
         return "❌ Authentication Error: Invalid OpenAI API key."
-    except openai.RateLimitError:
+    except openai.RateLimitError as e:
+        log_error_with_context(e, request_id, user_id)
         return "❌ Rate Limit Error: Too many requests. Please try again later."
     except openai.APIError as e:
+        log_error_with_context(e, request_id, user_id)
         return f"❌ API Error: {str(e)}"
     except Exception as e:
+        log_error_with_context(e, request_id, user_id)
         return f"❌ Unexpected error: {str(e)}"
+# handle other LLM-related functions like summarization, critique and decision making here as needed
+def summarize_chat_history(chat_history):
+    """Summarize chat history using OpenAI API"""
+    client = get_openai_client()
+    if not client:
+        return "❌ Error: No valid OpenAI API key configured."
+    
+    try:
+        summary_prompt = f"""
+        Summarize the following conversation between a user and an AI assistant. Focus on key points, decisions, and action items. Be concise but informative.
+        
+        Conversation:
+        {''.join([f"{msg['role'].capitalize()}: {msg['content']}\n" for msg in chat_history])}
+        
+        Summary:
+        """
+        
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": summary_prompt}],
+            max_tokens=500,
+            temperature=0.5
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        return f"❌ Error summarizing chat history: {str(e)}"
+
+
 
 def advanced_llm_response(user_message, user_id=None, chat_history=None):
     """LLM response function using real OpenAI API"""
-    print(f"📨 Received message: '{user_message}'")
+    logger.info(json.dumps({"event": "message_received", "user_message": user_message}, ensure_ascii=False))
     
     try:
         # Check if this is a project creation request
         if is_feedback_request(user_message):
-            print("💬 Detected feedback message")
+            logger.info(json.dumps({"event": "detected_feedback"}))
             
             feedback_responses = [
                 "Thank you for your feedback! 😊 How can I help you create something amazing today?",
@@ -136,7 +210,7 @@ def advanced_llm_response(user_message, user_id=None, chat_history=None):
             import random
             return random.choice(feedback_responses)
         elif is_project_creation_request(user_message):
-            print("🎯 Detected project creation request")
+            logger.info(json.dumps({"event": "detected_project_creation"}))
             
             # Use real OpenAI API for project creation
             project_prompt = f"""
@@ -161,7 +235,7 @@ def advanced_llm_response(user_message, user_id=None, chat_history=None):
             return response
         else:
             # Use real OpenAI API for general conversation
-            print("💬 General conversation detected")
+            logger.info(json.dumps({"event": "detected_general_conversation"}))
             
             conversation_prompt = f"""
             You are an AI Project Architect assistant. You specialize in helping users:
@@ -188,7 +262,6 @@ def advanced_llm_response(user_message, user_id=None, chat_history=None):
         
         Please check your OpenAI API key and try again."""
         
-        print(f"❌ Error in advanced_llm_response: {e}")
+        logger.error(json.dumps({"event": "error_in_response", "error": str(e)}))
         return error_response
 
-print("✅ llm_handler.py loaded successfully")

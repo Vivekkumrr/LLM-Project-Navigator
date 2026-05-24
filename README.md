@@ -4,7 +4,6 @@ A Minimal Chatbot application with Streamlit that allows users to create project
 
 ## Features
 
-- 🔐 **JWT Authentication** - Secure user registration and login
 - 🤖 **AI-Powered Project Creation** - Create projects through natural language
 - 💬 **Intelligent Assistant** - Conversational interface for project planning
 - 📊 **Project Management** - Save and view your created projects
@@ -59,5 +58,4 @@ Frontend: Streamlit-python
 Backend: Python
 DatabaseL SQLite3
 AI-Integration: OpenAI
-Authentication: JWT with custom implementation
-Password Hashing: SHA-256
+
